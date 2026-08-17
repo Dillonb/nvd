@@ -2,6 +2,11 @@
 
 ## 0.2.5 (unreleased)
 
+- Added a `--store` option for `nvd diff` and `nvd list`, which reads closure
+  metadata from the given store URI (such as `https://cache.nixos.org`) instead
+  of the local store, without downloading the store paths being compared.  Pass
+  it more than once for a closure that is split across several caches.
+
 - Fixed `nvd history` to ignore broken profile symlinks in case they were
   forcably removed somehow (issue #20).
 

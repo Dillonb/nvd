@@ -39,6 +39,7 @@
 
 import argparse
 import fnmatch
+import json
 import os
 import os.path
 import re
@@ -58,10 +59,15 @@ signal(SIGPIPE, SIG_DFL)  # Python handles SIGPIPE improperly by default.
 NVD_VERSION = "0.2.5"
 
 NIX_BIN_DIR = None
+NIX_STORE_URIS: list[str] = []  # Stores to query; empty means the local store.
 USE_NIX_COMMAND_FEATURE = False  # Whether to explicitly enable the nix-command feature.
 USE_COLOUR = False
 
 LIST_DEFAULT_ROOT = "/run/current-system"
+
+# Suffix of the store path holding a NixOS system's selected packages, i.e. what
+# <system>/sw points at.
+SYSTEM_PATH_SUFFIX = "-system-path"
 
 SGR_RESET = 0
 SGR_BOLD = 1
@@ -295,24 +301,14 @@ class PackageSet:
 
     @staticmethod
     def from_direct_dependencies(path: Path) -> "PackageSet":
-        return PackageSet.from_nix_query(["--references", str(path)])
+        return PackageSet.from_store_paths(query_references(path))
 
     @staticmethod
     def from_closure(path: Path) -> "PackageSet":
-        return PackageSet.from_nix_query(["--requisites", str(path)])
+        return PackageSet.from_store_paths(query_requisites(path))
 
     @staticmethod
-    def from_nix_query(nix_query_args: list[str]) -> "PackageSet":
-        result_paths_str: str = subprocess.run(
-            [make_nix_bin_path("nix-store"), "--query"] + nix_query_args,
-            stdout=PIPE,
-            text=True,
-            check=True,
-        ).stdout.rstrip("\n")
-
-        result_paths: list[str] = \
-            result_paths_str.split("\n") if result_paths_str else []
-
+    def from_store_paths(result_paths: list[str]) -> "PackageSet":
         packages = []
         for result_path in result_paths:
             pname, version = parse_pname_version(result_path)
@@ -804,26 +800,35 @@ def query_closure_disk_usage_bytes(target: Path) -> Optional[int]:
     if not target_str.startswith("/"):
         target_str = "./" + target_str
 
-    try:
-        stdout = subprocess.run(
-            [make_nix_bin_path("nix")]
-            + make_extra_experimental_features_args()
-            + ["path-info", "--closure-size", target_str],
-            stdout=PIPE,
-            text=True,
-            # Explicitly omitting check=True here, since this function is
-            # allowed to fail.
-        ).stdout
-    except FileNotFoundError:
-        sys.stderr.write("nvd: Error, couldn't run 'nix path-info --closure-size'.\n")
-        return None
+    for store_args in make_per_store_args():
+        try:
+            result = subprocess.run(
+                [make_nix_bin_path("nix")]
+                + make_extra_experimental_features_args()
+                + ["path-info"]
+                + store_args
+                + ["--closure-size", target_str],
+                stdout=PIPE,
+                stderr=PIPE,
+                text=True,
+                # Explicitly omitting check=True here, since this function is
+                # allowed to fail.
+            )
+        except FileNotFoundError:
+            sys.stderr.write("nvd: Error, couldn't run 'nix path-info --closure-size'.\n")
+            return None
 
-    lines = stdout.rstrip("\n").split("\n")
-    if len(lines) != 1:
-        return None
+        if result.returncode != 0:
+            continue
 
-    words = lines[0].split()
-    return int(words[-1])
+        lines = result.stdout.rstrip("\n").split("\n")
+        if len(lines) != 1:
+            return None
+
+        words = lines[0].split()
+        return int(words[-1])
+
+    return None
 
 BYTES_UNITS = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
 
@@ -856,6 +861,145 @@ def make_nix_bin_path(exe_name: str) -> str:
         return os.path.join(NIX_BIN_DIR, exe_name)
     else:
         return exe_name
+
+def make_per_store_args() -> list[list[str]]:
+    """Yields one --store argument list per configured store, in priority order.
+
+    A single empty list means "use nix's default store"."""
+    global NIX_STORE_URIS
+    if NIX_STORE_URIS:
+        return [["--store", uri] for uri in NIX_STORE_URIS]
+    else:
+        return [[]]
+
+def run_nix_store_query(query_args: list[str]) -> list[str]:
+    """Runs 'nix-store --query', trying each configured store in turn."""
+    errors: list[tuple[str, str]] = []
+    for store_args in make_per_store_args():
+        result = subprocess.run(
+            [make_nix_bin_path("nix-store")] + store_args + ["--query"] + query_args,
+            stdout=PIPE,
+            stderr=PIPE,
+            text=True,
+        )
+        if result.returncode == 0:
+            stdout = result.stdout.rstrip("\n")
+            return stdout.split("\n") if stdout else []
+        errors.append((store_args[1] if store_args else "local store", result.stderr))
+
+    for store, stderr in errors:
+        sys.stderr.write(f"nvd: {store}:\n")
+        sys.stderr.write(stderr)
+    if NIX_STORE_URIS:
+        sys.stderr.write(
+            "nvd: Hint, pass --store again for each further store holding part "
+            "of the closure.\n")
+    sys.exit(1)
+
+def query_references(path: Path) -> list[str]:
+    """Queries a path's direct references.
+
+    With --store this uses 'nix path-info', because 'nix-store --query' fails to
+    read from a binary cache under some Nix builds, notably Determinate Nix."""
+    if not NIX_STORE_URIS:
+        return run_nix_store_query(["--references", str(path)])
+
+    errors: list[tuple[str, str]] = []
+    for store_args in make_per_store_args():
+        result = subprocess.run(
+            [make_nix_bin_path("nix")]
+            + make_extra_experimental_features_args()
+            + ["path-info", "--json", "--json-format", "1"]
+            + store_args
+            # Consult only the given store, so that a path present elsewhere is
+            # never fetched just to answer a query.
+            + ["--option", "substituters", ""]
+            + [str(path)],
+            stdout=PIPE,
+            stderr=PIPE,
+            text=True,
+        )
+        store = store_args[1]
+        if result.returncode == 0:
+            references = parse_path_info_references(result.stdout)
+            if references is not None:
+                return references
+            # nix reports an absent path as a null entry, exiting successfully.
+            errors.append((store, f"error: path '{path}' is not valid\n"))
+        else:
+            errors.append((store, result.stderr))
+
+    for store, stderr in errors:
+        sys.stderr.write(f"nvd: {store}:\n")
+        sys.stderr.write(stderr)
+    sys.stderr.write(
+        "nvd: Hint, pass --store again for each further store holding part "
+        "of the closure.\n")
+    sys.exit(1)
+
+def parse_path_info_references(stdout: str) -> Optional[list[str]]:
+    info = next(iter(json.loads(stdout).values()), None)
+    return None if info is None else info["references"]
+
+def query_requisites(path: Path) -> list[str]:
+    if NIX_STORE_URIS:
+        return query_substitutable_closure(path)
+    return run_nix_store_query(["--requisites", str(path)])
+
+CLOSURE_PATH_RE = re.compile(r"^\s+(/nix/store/\S+)$")
+
+def query_substitutable_closure(path: Path) -> list[str]:
+    """Resolves a closure that is spread across several stores.
+
+    nix can only query one store at a time, so instead ask it what it would have
+    to substitute in order to realise the path into an empty store, using the
+    configured stores as substituters.  This reads only .narinfo metadata; the
+    dry run downloads nothing."""
+    result = subprocess.run(
+        [make_nix_bin_path("nix-store"), "--realise", "--dry-run",
+         "--store", "dummy://",
+         "--option", "substituters", " ".join(NIX_STORE_URIS),
+         "--option", "require-sigs", "false",
+         str(path)],
+        stdout=PIPE,
+        stderr=PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        sys.exit(1)
+
+    # Paths are reported under a header naming the section they belong to, and
+    # nix exits successfully even when part of the closure is unavailable.
+    fetchable: list[str] = []
+    unavailable: list[str] = []
+    section: Optional[list[str]] = None
+    for line in result.stderr.split("\n"):
+        match = CLOSURE_PATH_RE.match(line)
+        if match:
+            if section is not None:
+                section.append(match.group(1))
+        elif "will be fetched" in line:
+            section = fetchable
+        elif "don't know how to build" in line:
+            section = unavailable
+        else:
+            section = None
+
+    if unavailable:
+        sys.stderr.write(
+            f"nvd: Error, {len(unavailable)} path(s) in the closure of {path} are "
+            "not in any store given with --store, for example:\n")
+        for unavailable_path in unavailable[:3]:
+            sys.stderr.write(f"  {unavailable_path}\n")
+        sys.exit(1)
+
+    if not fetchable:
+        sys.stderr.write(f"nvd: Error, no store given with --store has {path}.\n")
+        sys.exit(1)
+
+    return fetchable
 
 def make_extra_experimental_features_args() -> list[str]:
     global USE_NIX_COMMAND_FEATURE
@@ -933,6 +1077,36 @@ def make_profile_generation_list(profile_link: Path, minimum_version: int) -> Li
 
     return profile_versions
 
+def resolve_root(path: Path) -> Path:
+    """Resolves symlinks in a root path.
+
+    With --store the path is usually absent locally, in which case it must
+    already be a store path."""
+    if path.exists():
+        path = path.resolve()
+
+    if NIX_STORE_URIS and not str(path).startswith("/nix/store/"):
+        sys.stderr.write(f"nvd: Error, --store requires full store paths: {path}\n")
+        sys.exit(1)
+
+    return path
+
+def find_system_path(root: Path) -> Optional[Path]:
+    """Returns the system-path component of a NixOS system closure, which holds
+    the selected packages, or None if root is not a NixOS system."""
+    if NIX_STORE_URIS:
+        # The sw symlink can't be read out of a remote store, so find its target
+        # among the system's direct references instead.
+        return next(
+            (Path(p)
+             for p in PackageSet.from_direct_dependencies(root).all_store_paths()
+             if p.endswith(SYSTEM_PATH_SUFFIX)),
+            None,
+        )
+
+    sw_path = root / "sw"
+    return sw_path.resolve() if sw_path.is_dir() else None
+
 def run_list(
     *,
     root,
@@ -943,7 +1117,7 @@ def run_list(
 ):
     path = Path(root)
 
-    if not path.exists():
+    if not NIX_STORE_URIS and not path.exists():
         sys.stderr.write(f"Path does not exist: {path}\n")
         if str(path) == LIST_DEFAULT_ROOT:
             sys.stderr.write(
@@ -953,11 +1127,9 @@ def run_list(
             )
         sys.exit(1)
 
-    path = path.resolve()
-    if (path / "sw").is_dir():
-        selected_set = PackageSet.from_direct_dependencies((path / "sw").resolve())
-    else:
-        selected_set = PackageSet.from_direct_dependencies(path)
+    path = resolve_root(path)
+    system_path = find_system_path(path)
+    selected_set = PackageSet.from_direct_dependencies(system_path or path)
 
     closure_set = PackageSet.from_closure(path)
 
@@ -995,16 +1167,16 @@ def run_diff(
     left_path = Path(root1)
     right_path = Path(root2)
 
-    if not left_path.exists():
+    if not NIX_STORE_URIS and not left_path.exists():
         sys.stderr.write(f"Path does not exist: {left_path}\n")
         sys.exit(1)
 
-    if not right_path.exists():
+    if not NIX_STORE_URIS and not right_path.exists():
         sys.stderr.write(f"Path does not exist: {right_path}\n")
         sys.exit(1)
 
-    left_resolved = left_path.resolve()
-    right_resolved = right_path.resolve()
+    left_resolved = resolve_root(left_path)
+    right_resolved = resolve_root(right_path)
 
     print(f"<<< {left_path}")
     print(f">>> {right_path}")
@@ -1012,12 +1184,13 @@ def run_diff(
     left_selected_set: Optional[PackageSet] = None
     right_selected_set: Optional[PackageSet] = None
 
-    if (left_resolved / "sw").is_dir() and (right_resolved / "sw").is_dir():
-        left_selected_set = PackageSet.from_direct_dependencies((left_resolved / "sw").resolve())
-        right_selected_set = PackageSet.from_direct_dependencies((right_resolved / "sw").resolve())
-    else:
-        left_selected_set = PackageSet.from_direct_dependencies(left_resolved)
-        right_selected_set = PackageSet.from_direct_dependencies(right_resolved)
+    left_system_path = find_system_path(left_resolved)
+    right_system_path = find_system_path(right_resolved)
+    if left_system_path is None or right_system_path is None:
+        left_system_path, right_system_path = left_resolved, right_resolved
+
+    left_selected_set = PackageSet.from_direct_dependencies(left_system_path)
+    right_selected_set = PackageSet.from_direct_dependencies(right_system_path)
 
     selected_sets = PackageSetPair(left_selected_set, right_selected_set)
 
@@ -1226,6 +1399,15 @@ def parse_args():
         default=None,
         help="Optional directory containing nix binaries, overrides path lookup.")
 
+    parser.add_argument(
+        "--store",
+        dest="store_uris",
+        action="append",
+        default=[],
+        metavar="URI",
+        help="Nix store URI to query instead of the local store, e.g. a binary "
+             "cache.  May be given more than once, in priority order.")
+
     subparsers = parser.add_subparsers(dest="action")
 
     diff_parser = subparsers.add_parser(
@@ -1280,6 +1462,7 @@ def parse_args():
 
 def main():
     global NIX_BIN_DIR
+    global NIX_STORE_URIS
     global USE_NIX_COMMAND_FEATURE
     global USE_COLOUR
     global INST_ADDED
@@ -1291,12 +1474,19 @@ def main():
     args = vars(parse_args())
     action = args["action"]
     NIX_BIN_DIR = args["nix_bin_dir"] or None
+    NIX_STORE_URIS = args["store_uris"]
     USE_COLOUR = \
         args["color"] == "always" \
         or (args["color"] == "auto" and sys.stdout.isatty() and not os.getenv('NO_COLOR'))
     del args["action"]
     del args["nix_bin_dir"]
+    del args["store_uris"]
     del args["color"]
+
+    if NIX_STORE_URIS and action == "history":
+        sys.stderr.write("nvd: Error, --store is not supported by 'history', "
+                         "which reads local profile links.\n")
+        sys.exit(1)
 
     if USE_COLOUR:
         INST_ADDED = sgr(SGR_FG + SGR_BRIGHT + SGR_GREEN) + INST_ADDED

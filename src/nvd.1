@@ -182,6 +182,18 @@ etc. binaries to use.  If provided, all invocations of Nix binaries will use
 this directory.  If empty or not provided, then invocations of Nix binaries will
 use regular path lookup.  This is the default.
 .TP
+--store=<uri>
+A Nix store to query instead of the local store, for example
+.B https://cache.nixos.org.
+Only closure metadata is read; the store paths themselves are not downloaded.
+May be given more than once, in priority order, for a closure that is split
+across several caches.  Requires full store paths rather than symlinks such as
+.B result,
+and is not supported by the
+.B history
+command.  Closure disk usage is omitted unless a single store holds the whole
+closure.
+.TP
 -s|--selected
 Only print out selected packages (direct dependencies).
 .TP
